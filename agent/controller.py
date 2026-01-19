@@ -57,8 +57,8 @@ class TTSPipelineController:
         
         # 创建新会话
         if persist:
-            result = self._service.create_session()
-            self.session_id = result["session_id"]
+            result = self._service.create_session(session_id=session_id)
+            self.session_id = session_id or result["session_id"]
             self._db_id = result["db_id"]
         else:
             self.session_id = session_id or str(uuid.uuid4())
@@ -294,8 +294,12 @@ class TTSPipelineController:
         on_chunk: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
         """阶段二：匹配音色"""
-        if self.status != SessionStatus.DIALOGUE_READY:
-            return {"success": False, "error": "请先确认对话列表"}
+        if not self.dialogue_list:
+            return {"success": False, "error": "对话列表为空，请先完成对话分析"}
+        if self.status == SessionStatus.VOICE_READY:
+            return {"success": False, "error": "已完成音色匹配，如需调整请使用重新匹配或更换音色"}
+        if self.status not in [SessionStatus.DIALOGUE_READY, SessionStatus.ERROR]:
+            return {"success": False, "error": "当前状态不支持音色匹配，请先完成对话分析"}
         
         self._update_status(SessionStatus.MATCHING)
         
@@ -516,13 +520,30 @@ class TTSPipelineController:
                     "failed": result.get("failed", 0),
                 }
             else:
-                self.error = result.get("error")
+                inferred_error = result.get("error")
+                if not inferred_error:
+                    for r in result.get("results", []) or []:
+                        if not r.get("success") and r.get("error"):
+                            inferred_error = r.get("error")
+                            break
+                if not inferred_error:
+                    total = result.get("total", len(items))
+                    failed = result.get("failed", total)
+                    inferred_error = f"合成失败（failed={failed}, total={total}）"
+
+                self.error = inferred_error
                 self._update_status(SessionStatus.ERROR)
                 
                 if self.persist and self._service:
                     self._service.mark_error(self.session_id, "synthesize", self.error or "Unknown error")
                 
-                return result
+                return {
+                    **result,
+                    "success": False,
+                    "session_id": self.session_id,
+                    "status": self.status.value,
+                    "error": self.error,
+                }
         except Exception as e:
             self.error = str(e)
             self._update_status(SessionStatus.ERROR)

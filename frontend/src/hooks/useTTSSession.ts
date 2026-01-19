@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import type { TTSSession, DialogueItem, SessionStatus, SessionListItem } from '@/types'
 import * as api from '@/services/api'
 
@@ -7,6 +7,7 @@ interface UseTTSSessionReturn {
   loading: boolean
   error: string | null
   streamingText: string
+  isStreaming: boolean
   
   // 会话管理
   createSession: () => Promise<string | undefined>
@@ -18,7 +19,7 @@ interface UseTTSSessionReturn {
   analyzeDialogue: (userInput: string) => Promise<void>
   refineDialogue: (instruction: string, targetIndices?: number[]) => Promise<void>
   updateDialogues: (dialogueList: DialogueItem[]) => Promise<void>
-  confirmStage1: () => Promise<void>
+  confirmStage1: () => Promise<boolean>
   
   // 阶段二
   matchVoices: () => Promise<void>
@@ -46,12 +47,17 @@ export function useTTSSession(initialSessionId?: string): UseTTSSessionReturn {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [streamingText, setStreamingText] = useState('')
+  const [isStreaming, setIsStreaming] = useState(false)
+  const cancelStreamRef = useRef<null | (() => void)>(null)
   
   const reset = useCallback(() => {
+    cancelStreamRef.current?.()
+    cancelStreamRef.current = null
     setSession(null)
     setLoading(false)
     setError(null)
     setStreamingText('')
+    setIsStreaming(false)
   }, [])
   
   // 加载初始会话
@@ -62,6 +68,10 @@ export function useTTSSession(initialSessionId?: string): UseTTSSessionReturn {
   }, [initialSessionId])
   
   const loadSessionInternal = async (sessionId: string) => {
+    cancelStreamRef.current?.()
+    cancelStreamRef.current = null
+    setStreamingText('')
+    setIsStreaming(false)
     setLoading(true)
     setError(null)
     try {
@@ -79,6 +89,10 @@ export function useTTSSession(initialSessionId?: string): UseTTSSessionReturn {
   }
   
   const createSession = useCallback(async (): Promise<string | undefined> => {
+    cancelStreamRef.current?.()
+    cancelStreamRef.current = null
+    setStreamingText('')
+    setIsStreaming(false)
     setLoading(true)
     setError(null)
     try {
@@ -136,24 +150,47 @@ export function useTTSSession(initialSessionId?: string): UseTTSSessionReturn {
     setLoading(true)
     setError(null)
     setStreamingText('')
+    setIsStreaming(true)
+    cancelStreamRef.current?.()
+    cancelStreamRef.current = null
+    setSession(prev => prev ? { ...prev, status: 'analyzing' as SessionStatus } : null)
     
     try {
-      const result = await api.analyzeDialogue(session.session_id, userInput)
-      
-      if (result.success) {
-        setSession(prev => prev ? {
-          ...prev,
-          status: result.status as SessionStatus,
-          input_type: result.input_type,
-          dialogue_list: result.dialogue_list || [],
-        } : null)
-      } else {
-        setError(result.error || '分析失败')
-      }
+      await new Promise<void>((resolve) => {
+        const cancel = api.analyzeDialogueStream(
+          session.session_id,
+          userInput,
+          (chunk) => setStreamingText((prev) => prev + chunk),
+          (data) => {
+            cancelStreamRef.current = null
+            const result = data as Record<string, unknown>
+            if (result?.success) {
+              setSession(prev => prev ? {
+                ...prev,
+                status: (result.status as SessionStatus) || ('dialogue_ready' as SessionStatus),
+                input_type: result.input_type as TTSSession['input_type'],
+                dialogue_list: (result.dialogue_list as DialogueItem[]) || [],
+              } : null)
+            } else {
+              setError((result?.error as string) || '分析失败')
+            }
+            resolve()
+          },
+          (err) => {
+            cancelStreamRef.current = null
+            if (err.name !== 'AbortError') {
+              setError(err.message)
+            }
+            resolve()
+          }
+        )
+        cancelStreamRef.current = cancel
+      })
     } catch (e) {
       setError((e as Error).message)
     } finally {
       setLoading(false)
+      setIsStreaming(false)
     }
   }, [session])
   
@@ -205,8 +242,8 @@ export function useTTSSession(initialSessionId?: string): UseTTSSessionReturn {
     }
   }, [session])
   
-  const confirmStage1 = useCallback(async () => {
-    if (!session) return
+  const confirmStage1 = useCallback(async (): Promise<boolean> => {
+    if (!session) return false
     
     setLoading(true)
     setError(null)
@@ -219,11 +256,14 @@ export function useTTSSession(initialSessionId?: string): UseTTSSessionReturn {
           ...prev,
           status: result.status as SessionStatus,
         } : null)
+        return true
       } else {
         setError(result.error || '确认失败')
+        return false
       }
     } catch (e) {
       setError((e as Error).message)
+      return false
     } finally {
       setLoading(false)
     }
@@ -231,27 +271,60 @@ export function useTTSSession(initialSessionId?: string): UseTTSSessionReturn {
   
   const matchVoices = useCallback(async () => {
     if (!session) return
+    if (!session.dialogue_list?.length) {
+      setError('对话列表为空，请先完成对话分析')
+      return
+    }
+    if (session.status !== 'dialogue_ready') {
+      setError('请先确认对话列表')
+      return
+    }
     
     setLoading(true)
     setError(null)
     setStreamingText('')
+    setIsStreaming(true)
+    cancelStreamRef.current?.()
+    cancelStreamRef.current = null
+    const prevStatus = session.status
+    setSession(prev => prev ? { ...prev, status: 'matching' as SessionStatus } : null)
     
     try {
-      const result = await api.matchVoices(session.session_id)
-      
-      if (result.success) {
-        setSession(prev => prev ? {
-          ...prev,
-          status: result.status as SessionStatus,
-          voice_mapping: result.voice_mapping || [],
-        } : null)
-      } else {
-        setError(result.error || '匹配失败')
-      }
+      await new Promise<void>((resolve) => {
+        const cancel = api.matchVoicesStream(
+          session.session_id,
+          (chunk) => setStreamingText((prev) => prev + chunk),
+          (data) => {
+            cancelStreamRef.current = null
+            const result = data as Record<string, unknown>
+            if (result?.success) {
+              setSession(prev => prev ? {
+                ...prev,
+                status: (result.status as SessionStatus) || ('voice_ready' as SessionStatus),
+                voice_mapping: (result.voice_mapping as TTSSession['voice_mapping']) || [],
+              } : null)
+            } else {
+              setError((result?.error as string) || '匹配失败')
+              setSession(prev => prev ? { ...prev, status: prevStatus as SessionStatus } : null)
+            }
+            resolve()
+          },
+          (err) => {
+            cancelStreamRef.current = null
+            if (err.name !== 'AbortError') {
+              setError(err.message)
+              setSession(prev => prev ? { ...prev, status: prevStatus as SessionStatus } : null)
+            }
+            resolve()
+          }
+        )
+        cancelStreamRef.current = cancel
+      })
     } catch (e) {
       setError((e as Error).message)
     } finally {
       setLoading(false)
+      setIsStreaming(false)
     }
   }, [session])
   
@@ -268,6 +341,9 @@ export function useTTSSession(initialSessionId?: string): UseTTSSessionReturn {
         setSession(prev => prev ? {
           ...prev,
           voice_mapping: result.voice_mapping || [],
+          status: 'voice_ready' as SessionStatus,
+          audio_files: [],
+          merged_audio: undefined,
         } : null)
       } else {
         setError(result.error || '重新匹配失败')
@@ -292,6 +368,9 @@ export function useTTSSession(initialSessionId?: string): UseTTSSessionReturn {
         setSession(prev => prev ? {
           ...prev,
           voice_mapping: result.voice_mapping || [],
+          status: 'voice_ready' as SessionStatus,
+          audio_files: [],
+          merged_audio: undefined,
         } : null)
       } else {
         setError(result.error || '更换音色失败')
@@ -342,6 +421,8 @@ export function useTTSSession(initialSessionId?: string): UseTTSSessionReturn {
           status: result.status as SessionStatus,
           audio_files: result.audio_files || [],
           merged_audio: result.merged_audio,
+          audio_file_urls: result.audio_file_urls || [],
+          merged_audio_url: result.merged_audio_url,
         } : null)
       } else {
         setError(result.error || '合成失败')
@@ -358,6 +439,7 @@ export function useTTSSession(initialSessionId?: string): UseTTSSessionReturn {
     loading,
     error,
     streamingText,
+    isStreaming,
     createSession,
     loadSession,
     deleteSession,

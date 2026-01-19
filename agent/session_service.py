@@ -22,11 +22,13 @@ class TTSSessionService:
     
     def create_session(
         self,
+        session_id: Optional[str] = None,
         user_input: Optional[str] = None,
         project_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """创建新会话"""
         tts_session = self.repo.create(
+            session_id=session_id,
             user_input=user_input,
             project_id=project_id,
         )

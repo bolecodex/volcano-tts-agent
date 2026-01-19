@@ -86,7 +86,7 @@ def tts_preview(
         filename = f"preview_{uuid.uuid4().hex[:8]}.mp3"
         output_path = os.path.join(out_dir, filename)
         
-        result = service.synthesize(text=text, config=config, output_path=output_path)
+        result = service.synthesize_auto(text=text, config=config, output_path=output_path)
         
         if result.success:
             return {
@@ -126,7 +126,7 @@ def tts_synthesize(
             filename = f"synth_{uuid.uuid4().hex[:8]}.mp3"
             output_path = os.path.join(DEFAULT_OUTPUT_DIR, filename)
         
-        result = service.synthesize(text=text, config=config, output_path=output_path)
+        result = service.synthesize_auto(text=text, config=config, output_path=output_path)
         
         if result.success:
             return {
@@ -359,25 +359,85 @@ def audio_merge(
         包含 success, merged_audio_path, total_duration_ms, error 的字典
     """
     try:
-        from pydub import AudioSegment
-        
         if not audio_paths:
             return {"success": False, "error": "音频路径列表为空"}
-        
+
         for path in audio_paths:
             if not os.path.exists(path):
                 return {"success": False, "error": f"音频文件不存在: {path}"}
-        
+
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+        suffix = Path(output_path).suffix.lower()
+        if suffix == ".mp3":
+            import shutil
+            import subprocess
+
+            ffmpeg = shutil.which("ffmpeg")
+            if ffmpeg:
+                try:
+                    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+                        concat_list_path = f.name
+                        for p in audio_paths:
+                            safe_path = p.replace("'", "'\\''")
+                            f.write(f"file '{safe_path}'\n")
+
+                    proc = subprocess.run(
+                        [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", concat_list_path, "-c", "copy", output_path],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=False,
+                    )
+                    if proc.returncode == 0 and os.path.exists(output_path):
+                        return {
+                            "success": True,
+                            "merged_audio_path": output_path,
+                            "total_duration_ms": None,
+                        }
+                finally:
+                    try:
+                        os.remove(concat_list_path)
+                    except Exception:
+                        pass
+
+            def _strip_id3v2(data: bytes) -> bytes:
+                if len(data) < 10 or data[:3] != b"ID3":
+                    return data
+                size_bytes = data[6:10]
+                tag_size = 0
+                for b in size_bytes:
+                    tag_size = (tag_size << 7) | (b & 0x7F)
+                start = 10 + tag_size
+                return data[start:] if start < len(data) else b""
+
+            with open(output_path, "wb") as out_f:
+                for i, p in enumerate(audio_paths):
+                    with open(p, "rb") as in_f:
+                        data = in_f.read()
+                    if i > 0:
+                        data = _strip_id3v2(data)
+                    out_f.write(data)
+
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                return {
+                    "success": True,
+                    "merged_audio_path": output_path,
+                    "total_duration_ms": None,
+                }
+            return {"success": False, "error": "合并失败：无法生成输出文件"}
+
+        from pydub import AudioSegment
+
         merged = AudioSegment.from_file(audio_paths[0])
         gap = AudioSegment.silent(duration=gap_ms)
-        
+
         for path in audio_paths[1:]:
             audio = AudioSegment.from_file(path)
             merged = merged + gap + audio
-        
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        merged.export(output_path, format="mp3")
-        
+
+        merged.export(output_path, format=suffix.lstrip(".") or "mp3")
+
         return {
             "success": True,
             "merged_audio_path": output_path,

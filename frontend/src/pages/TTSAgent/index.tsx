@@ -26,27 +26,25 @@ import StageIndicator from './components/StageIndicator'
 import DialogueList from './components/DialogueList'
 import VoiceMappingList from './components/VoiceMappingList'
 import ResultPanel from './components/ResultPanel'
-import type { Stage, StreamingLog } from '@/types'
+import type { DialogueItem, Stage, StreamingLog } from '@/types'
 
 export default function TTSAgentPage() {
   const [userInput, setUserInput] = useState('')
   const [streamingLogs, setStreamingLogs] = useState<StreamingLog[]>([])
-  const [isStreaming, setIsStreaming] = useState(false)
   
   const {
     session,
     loading,
     error,
+    streamingText,
+    isStreaming,
     createSession,
     loadSession,
     deleteSession,
-    refreshSession,
     analyzeDialogue,
-    refineDialogue,
     updateDialogues,
     confirmStage1,
     matchVoices,
-    rematchVoices,
     changeVoice,
     confirmStage2,
     synthesizeAudio,
@@ -77,6 +75,8 @@ export default function TTSAgentPage() {
   
   // 创建新会话
   const handleCreateSession = async () => {
+    setStreamingLogs([])
+    setUserInput('')
     const newSessionId = await createSession()
     if (newSessionId) {
       sessionList.refresh()
@@ -105,7 +105,8 @@ export default function TTSAgentPage() {
   
   // 确认对话并进入阶段二
   const handleConfirmDialogue = async () => {
-    await confirmStage1()
+    const ok = await confirmStage1()
+    if (!ok) return
     await matchVoices()
   }
   
@@ -121,7 +122,7 @@ export default function TTSAgentPage() {
   }
 
   // 更新对话
-  const handleUpdateDialogues = async (dialogues: any[]) => {
+  const handleUpdateDialogues = async (dialogues: DialogueItem[]) => {
     await updateDialogues(dialogues)
   }
   
@@ -268,6 +269,22 @@ export default function TTSAgentPage() {
                             placeholder={`输入要转换为语音的内容...\n\n支持以下输入类型：\n• 话题关键词（如：职场面试、科技新闻）\n• 完整文章\n• 对话脚本`}
                             className="cyber-input h-44 resize-none font-body"
                           />
+
+                          {(isStreaming || streamingText.trim()) && (
+                            <div className="mt-4 p-4 bg-cyber-bg rounded-xl border border-cyber-border">
+                              <div className="flex items-center justify-between mb-2">
+                                <span className="text-sm text-slate-300">
+                                  {isStreaming ? '分析中...' : '分析输出'}
+                                </span>
+                                <span className="text-xs text-slate-500">
+                                  {streamingText.length > 0 && `${streamingText.length} 字符`}
+                                </span>
+                              </div>
+                              <pre className="text-xs text-slate-400 whitespace-pre-wrap break-words max-h-56 overflow-auto">
+                                {streamingText}
+                              </pre>
+                            </div>
+                          )}
                           
                           <div className="flex items-center justify-between mt-5">
                             <p className="text-xs text-slate-500">

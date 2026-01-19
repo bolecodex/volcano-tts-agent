@@ -10,6 +10,9 @@ import uuid
 import json
 import asyncio
 import logging
+import re
+import hashlib
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 
@@ -37,6 +40,77 @@ _executor = ThreadPoolExecutor(max_workers=4)
 
 # 全局 pipeline 缓存
 _pipeline_cache: Dict[str, TTSPipelineController] = {}
+
+def _sanitize_object_name(name: str) -> str:
+    cleaned = re.sub(r"[^0-9A-Za-z._-]+", "_", name.strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned or "file"
+
+
+def _get_tos_client():
+    try:
+        import tos
+    except Exception:
+        return None
+
+    ak = os.getenv("TOS_ACCESS_KEY") or os.getenv("VOLCENGINE_ACCESS_KEY") or ""
+    sk = os.getenv("TOS_SECRET_KEY") or os.getenv("VOLCENGINE_SECRET_KEY") or ""
+    endpoint = os.getenv("TOS_ENDPOINT") or ""
+    region = os.getenv("TOS_REGION") or ""
+
+    if not (ak and sk and endpoint and region):
+        return None
+
+    return tos.TosClientV2(ak, sk, endpoint, region)
+
+
+def _upload_file_to_tos(
+    local_path: str,
+    session_id: str,
+    content_type: Optional[str] = None,
+) -> Optional[dict]:
+    client = _get_tos_client()
+    if client is None:
+        return None
+
+    bucket = os.getenv("TOS_BUCKET") or ""
+    if not bucket:
+        return None
+
+    prefix = (os.getenv("TOS_PREFIX") or "tts-agent-output").strip("/")
+    expires = int(os.getenv("TOS_URL_EXPIRES", "3600"))
+
+    p = Path(local_path)
+    if not p.exists() or not p.is_file():
+        return None
+
+    filename = _sanitize_object_name(p.name)
+    object_key = f"{prefix}/{session_id}/{filename}"
+
+    inferred_ct = content_type
+    if not inferred_ct:
+        ext = p.suffix.lower()
+        if ext == ".mp3":
+            inferred_ct = "audio/mpeg"
+        elif ext == ".wav":
+            inferred_ct = "audio/wav"
+        elif ext == ".ogg":
+            inferred_ct = "audio/ogg"
+        elif ext == ".pcm":
+            inferred_ct = "application/octet-stream"
+
+    client.put_object_from_file(
+        bucket=bucket,
+        key=object_key,
+        file_path=str(p),
+        content_type=inferred_ct,
+    )
+    url = client.generate_presigned_url("GET", Bucket=bucket, Key=object_key, ExpiresIn=expires)
+    return {"bucket": bucket, "key": object_key, "url": url}
+
+
+def _is_tos_upload_enabled() -> bool:
+    return (os.getenv("TOS_UPLOAD_ENABLED") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _get_or_create_pipeline(session_id: Optional[str] = None) -> TTSPipelineController:
@@ -180,22 +254,48 @@ async def analyze_dialogue_stream(session_id: str, request: AnalyzeRequest):
         pipeline = _get_or_create_pipeline(session_id)
         
         async def generate():
-            chunks = []
-            
+            loop = asyncio.get_running_loop()
+            queue: asyncio.Queue[str] = asyncio.Queue()
+
             def on_chunk(chunk: str):
-                chunks.append(chunk)
-            
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                _executor,
-                lambda: asyncio.run(pipeline.stage1_analyze(request.user_input, on_chunk=on_chunk))
-            )
-            
-            # 流式发送所有收集的 chunks
-            for chunk in chunks:
-                yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
-            
-            yield f"data: {json.dumps({'type': 'result', 'data': result})}\n\n"
+                loop.call_soon_threadsafe(queue.put_nowait, chunk)
+
+            def run_pipeline():
+                return asyncio.run(
+                    pipeline.stage1_analyze(request.user_input, on_chunk=on_chunk)
+                )
+
+            result_future = loop.run_in_executor(_executor, run_pipeline)
+            chunk_task = asyncio.create_task(queue.get())
+
+            try:
+                while True:
+                    done, _pending = await asyncio.wait(
+                        {result_future, chunk_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+
+                    if chunk_task in done:
+                        chunk = chunk_task.result()
+                        yield f"data: {json.dumps({'type': 'chunk', 'content': chunk}, ensure_ascii=False)}\n\n"
+                        chunk_task = asyncio.create_task(queue.get())
+
+                    if result_future in done:
+                        try:
+                            result = result_future.result()
+                        except Exception as e:
+                            payload = {"success": False, "error": str(e)}
+                            yield f"data: {json.dumps({'type': 'result', 'data': payload}, ensure_ascii=False)}\n\n"
+                            return
+
+                        while not queue.empty():
+                            chunk = queue.get_nowait()
+                            yield f"data: {json.dumps({'type': 'chunk', 'content': chunk}, ensure_ascii=False)}\n\n"
+
+                        yield f"data: {json.dumps({'type': 'result', 'data': result}, ensure_ascii=False)}\n\n"
+                        return
+            finally:
+                chunk_task.cancel()
         
         return StreamingResponse(
             generate(),
@@ -203,6 +303,7 @@ async def analyze_dialogue_stream(session_id: str, request: AnalyzeRequest):
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
             }
         )
     except Exception as e:
@@ -292,21 +393,46 @@ async def match_voices_stream(session_id: str):
         pipeline = _get_or_create_pipeline(session_id)
         
         async def generate():
-            chunks = []
-            
+            loop = asyncio.get_running_loop()
+            queue: asyncio.Queue[str] = asyncio.Queue()
+
             def on_chunk(chunk: str):
-                chunks.append(chunk)
-            
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                _executor,
-                lambda: asyncio.run(pipeline.stage2_match(on_chunk=on_chunk))
-            )
-            
-            for chunk in chunks:
-                yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
-            
-            yield f"data: {json.dumps({'type': 'result', 'data': result})}\n\n"
+                loop.call_soon_threadsafe(queue.put_nowait, chunk)
+
+            def run_pipeline():
+                return asyncio.run(pipeline.stage2_match(on_chunk=on_chunk))
+
+            result_future = loop.run_in_executor(_executor, run_pipeline)
+            chunk_task = asyncio.create_task(queue.get())
+
+            try:
+                while True:
+                    done, _pending = await asyncio.wait(
+                        {result_future, chunk_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+
+                    if chunk_task in done:
+                        chunk = chunk_task.result()
+                        yield f"data: {json.dumps({'type': 'chunk', 'content': chunk}, ensure_ascii=False)}\n\n"
+                        chunk_task = asyncio.create_task(queue.get())
+
+                    if result_future in done:
+                        try:
+                            result = result_future.result()
+                        except Exception as e:
+                            payload = {"success": False, "error": str(e)}
+                            yield f"data: {json.dumps({'type': 'result', 'data': payload}, ensure_ascii=False)}\n\n"
+                            return
+
+                        while not queue.empty():
+                            chunk = queue.get_nowait()
+                            yield f"data: {json.dumps({'type': 'chunk', 'content': chunk}, ensure_ascii=False)}\n\n"
+
+                        yield f"data: {json.dumps({'type': 'result', 'data': result}, ensure_ascii=False)}\n\n"
+                        return
+            finally:
+                chunk_task.cancel()
         
         return StreamingResponse(
             generate(),
@@ -314,6 +440,7 @@ async def match_voices_stream(session_id: str):
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
             }
         )
     except Exception as e:
@@ -393,7 +520,26 @@ async def synthesize_audio(session_id: str):
             _executor,
             lambda: asyncio.run(pipeline.stage3_synthesize())
         )
-        
+
+        if result.get("success") and _is_tos_upload_enabled():
+            audio_file_urls: List[dict] = []
+            merged_audio_url: Optional[dict] = None
+
+            try:
+                for local_path in result.get("audio_files", []) or []:
+                    uploaded = _upload_file_to_tos(local_path=local_path, session_id=session_id)
+                    if uploaded:
+                        audio_file_urls.append(uploaded)
+
+                merged_path = result.get("merged_audio")
+                if merged_path:
+                    merged_audio_url = _upload_file_to_tos(local_path=merged_path, session_id=session_id)
+            except Exception:
+                logger.exception("tos_upload_failed")
+
+            result["audio_file_urls"] = audio_file_urls
+            result["merged_audio_url"] = merged_audio_url
+
         return result
     except Exception as e:
         logger.exception(f"合成失败: {session_id}")
@@ -551,3 +697,55 @@ async def preview_voice(
 async def health_check():
     """健康检查"""
     return {"status": "ok", "service": "tts-agent"}
+
+
+@router.get("/debug/tts-credentials")
+async def debug_tts_credentials():
+    from backend.services import DoubaoTTSService
+
+    def fp(value: str) -> str:
+        if not value:
+            return ""
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+
+    svc = DoubaoTTSService()
+    env_presence = {}
+    for key in (
+        "DOUBAO_TTS_APP_ID",
+        "DOUBAO_TTS_APP_KEY",
+        "DOUBAO_TTS_APPID",
+        "DOUBAO_TTS_ACCESS_TOKEN",
+        "DOUBAO_TTS_AK",
+        "DOUBAO_TTS_ACCESS_KEY",
+        "TTS_APP_ID",
+        "TTS_APP_KEY",
+        "TTS_ACCESS_KEY",
+        "DOUBAO_TTS_APP_ID_TTS2",
+        "DOUBAO_TTS_APP_KEY_TTS2",
+        "DOUBAO_TTS_APP_ID_2",
+        "DOUBAO_TTS_ACCESS_TOKEN_TTS2",
+        "DOUBAO_TTS_AK_TTS2",
+        "DOUBAO_TTS_ACCESS_TOKEN_2",
+        "DOUBAO_TTS_AK_2",
+    ):
+        env_presence[key] = bool((os.getenv(key) or "").strip())
+    resources: dict[str, dict[str, object]] = {}
+    for rid in ("seed-tts-1.0", "seed-tts-2.0", "seed-icl-1.0", "seed-icl-2.0"):
+        app_id, access_token, app_id_source, access_token_source = svc._resolve_credentials_for_resource(rid)
+        resources[rid] = {
+            "app_id": app_id,
+            "app_id_source": app_id_source,
+            "access_token_len": len(access_token or ""),
+            "access_token_sha256_8": fp(access_token),
+            "access_token_source": access_token_source,
+        }
+
+    return {
+        "app_id": svc.app_id,
+        "app_id_source": getattr(svc, "app_id_source", ""),
+        "access_token_len": len(svc.access_token or ""),
+        "access_token_sha256_8": fp(svc.access_token),
+        "access_token_source": getattr(svc, "access_token_source", ""),
+        "env_presence": env_presence,
+        "resources": resources,
+    }

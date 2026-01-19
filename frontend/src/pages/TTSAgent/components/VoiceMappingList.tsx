@@ -25,7 +25,7 @@ import {
   Check,
   Search,
 } from 'lucide-react'
-import { listVoices, getVoiceCategories } from '@/services/api'
+import { listVoices, getVoiceCategories, previewVoice } from '@/services/api'
 import type { VoiceMapping, VoiceInfo, VoiceCategory, StreamingLog } from '@/types'
 
 interface VoiceMappingListProps {
@@ -229,6 +229,9 @@ function VoiceCard({
   voiceError,
 }: VoiceCardProps) {
   const [isPlaying, setIsPlaying] = useState(false)
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false)
+  const [previewError, setPreviewError] = useState<string | null>(null)
   const [showSelector, setShowSelector] = useState(false)
   const [search, setSearch] = useState('')
   const [selectedCategory, setSelectedCategory] = useState('')
@@ -237,25 +240,56 @@ function VoiceCard({
   const audioRef = useRef<HTMLAudioElement>(null)
   const selectorRef = useRef<HTMLDivElement>(null)
 
-  // 将本地路径转换为可访问的 URL
-  const previewAudioUrl = useMemo(
-    () => mapping.preview_audio ? `/api/tts/audio/${mapping.preview_audio}` : null,
-    [mapping.preview_audio]
-  )
+  const releasePreviewUrl = useCallback((url: string | null) => {
+    if (!url) return
+    URL.revokeObjectURL(url)
+  }, [])
+
+  const ensurePreviewUrl = useCallback(async () => {
+    if (previewUrl) return previewUrl
+    if (!mapping.voice_id) return null
+
+    setIsPreviewLoading(true)
+    setPreviewError(null)
+    try {
+      const blob = await previewVoice(
+        mapping.voice_id,
+        mapping.preview_text || mapping.character || '你好，这是一段试听文本。'
+      )
+      const url = URL.createObjectURL(blob)
+      setPreviewUrl((prev) => {
+        releasePreviewUrl(prev)
+        return url
+      })
+      return url
+    } catch (err) {
+      setPreviewError((err as Error).message || '试听生成失败')
+      return null
+    } finally {
+      setIsPreviewLoading(false)
+    }
+  }, [mapping.character, mapping.preview_text, mapping.voice_id, previewUrl, releasePreviewUrl])
 
   // 播放/暂停试听
   const togglePlay = async () => {
-    if (!audioRef.current || !previewAudioUrl) return
+    if (!audioRef.current) return
+    const url = await ensurePreviewUrl()
+    if (!url) return
 
     if (isPlaying) {
       audioRef.current.pause()
       setIsPlaying(false)
     } else {
       try {
+        if (audioRef.current.src !== url) {
+          audioRef.current.pause()
+          audioRef.current.src = url
+          audioRef.current.load()
+        }
         await audioRef.current.play()
         setIsPlaying(true)
       } catch (err) {
-        console.error('播放失败:', err)
+        setPreviewError((err as Error).message || '播放失败')
       }
     }
   }
@@ -294,6 +328,11 @@ function VoiceCard({
     setIsChanging(true)
     try {
       await onChangeVoice(mapping.character, voice.voice_id, voice.name)
+      setIsPlaying(false)
+      setPreviewUrl((prev) => {
+        releasePreviewUrl(prev)
+        return null
+      })
       setShowSelector(false)
     } catch (err) {
       console.error('更换音色失败:', err)
@@ -301,6 +340,26 @@ function VoiceCard({
       setIsChanging(false)
     }
   }
+
+  useEffect(() => {
+    setIsPlaying(false)
+    setPreviewError(null)
+    setPreviewUrl((prev) => {
+      releasePreviewUrl(prev)
+      return null
+    })
+    if (audioRef.current) {
+      audioRef.current.pause()
+      audioRef.current.src = ''
+      audioRef.current.load()
+    }
+  }, [mapping.voice_id, mapping.preview_text, releasePreviewUrl])
+
+  useEffect(() => {
+    return () => {
+      releasePreviewUrl(previewUrl)
+    }
+  }, [previewUrl, releasePreviewUrl])
 
   useEffect(() => {
     if (!showSelector) return
@@ -319,7 +378,7 @@ function VoiceCard({
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ delay: index * 0.1 }}
-      className="glass-card p-5"
+      className={`glass-card p-5 relative ${showSelector ? 'z-50' : 'z-0'}`}
     >
       <div className="flex items-start gap-4">
         {/* 角色图标 */}
@@ -349,15 +408,23 @@ function VoiceCard({
           )}
 
           {/* 试听播放器 */}
-          {previewAudioUrl && (
+          <div className="space-y-2">
             <div className="flex items-center gap-3 p-3 bg-cyber-bg/50 rounded-lg border border-cyber-border/50">
               <button
                 onClick={togglePlay}
+                disabled={isPreviewLoading || !mapping.voice_id}
                 className="flex-shrink-0 w-8 h-8 rounded-full bg-neon-purple/20 
                          flex items-center justify-center text-neon-purple
-                         hover:bg-neon-purple/30 transition-colors cursor-pointer"
+                         hover:bg-neon-purple/30 transition-colors cursor-pointer
+                         disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {isPlaying ? <Pause size={14} /> : <Play size={14} />}
+                {isPreviewLoading ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : isPlaying ? (
+                  <Pause size={14} />
+                ) : (
+                  <Play size={14} />
+                )}
               </button>
 
               <div className="flex-1">
@@ -369,13 +436,11 @@ function VoiceCard({
                 </div>
               </div>
 
-              <audio
-                ref={audioRef}
-                src={previewAudioUrl}
-                onEnded={handleEnded}
-              />
+              <audio ref={audioRef} onEnded={handleEnded} />
             </div>
-          )}
+
+            {previewError && <div className="text-xs text-red-400">{previewError}</div>}
+          </div>
         </div>
 
         {/* 更换音色按钮 */}
@@ -395,7 +460,7 @@ function VoiceCard({
             <div
               ref={selectorRef}
               className="absolute top-full right-0 mt-2 w-96 bg-cyber-surface border border-cyber-border 
-                       rounded-xl shadow-xl z-10 overflow-hidden"
+                       rounded-xl shadow-xl z-[70] overflow-hidden"
             >
               <div className="p-3 border-b border-cyber-border space-y-2">
                 <div className="text-xs text-slate-500">选择音色</div>

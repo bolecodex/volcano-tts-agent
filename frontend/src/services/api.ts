@@ -1,10 +1,23 @@
 import axios from 'axios'
+import type { DialogueItem } from '@/types'
+
+const runtimeBaseUrl = (import.meta.env.VITE_TTS_API_BASE_URL || '').trim().replace(/\/$/, '')
+const apiBaseUrl = runtimeBaseUrl ? `${runtimeBaseUrl}/api/tts` : '/api/tts'
+const runtimeApiKey = (import.meta.env.VITE_TTS_API_KEY || '').trim()
+
+const defaultHeaders: Record<string, string> = {
+  'Content-Type': 'application/json',
+}
+
+if (runtimeApiKey) {
+  defaultHeaders.Authorization = `Bearer ${runtimeApiKey}`
+}
 
 const api = axios.create({
-  baseURL: '/api/tts',
+  baseURL: apiBaseUrl,
   timeout: 120000,
   headers: {
-    'Content-Type': 'application/json',
+    ...defaultHeaders,
   },
 })
 
@@ -51,19 +64,23 @@ export function analyzeDialogueStream(
   sessionId: string,
   userInput: string,
   onChunk: (chunk: string) => void,
-  onResult: (result: any) => void,
+  onResult: (result: unknown) => void,
   onError: (error: Error) => void
 ) {
-  const eventSource = new EventSource(
-    `/api/tts/sessions/${sessionId}/analyze/stream?user_input=${encodeURIComponent(userInput)}`
-  )
-  
   // SSE 需要 POST，这里用 fetch
-  fetch(`/api/tts/sessions/${sessionId}/analyze/stream`, {
+  const controller = new AbortController()
+  const url = `${apiBaseUrl}/sessions/${sessionId}/analyze/stream`
+
+  fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: defaultHeaders,
     body: JSON.stringify({ user_input: userInput }),
+    signal: controller.signal,
   }).then(async (response) => {
+    if (!response.ok) {
+      onError(new Error(`Stream request failed: ${response.status}`))
+      return
+    }
     const reader = response.body?.getReader()
     const decoder = new TextDecoder()
     
@@ -72,31 +89,38 @@ export function analyzeDialogueStream(
       return
     }
     
+    let buffer = ''
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
       
-      const text = decoder.decode(value)
-      const lines = text.split('\n')
-      
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          try {
-            const data = JSON.parse(line.slice(6))
-            if (data.type === 'chunk') {
-              onChunk(data.content)
-            } else if (data.type === 'result') {
-              onResult(data.data)
+      buffer += decoder.decode(value, { stream: true })
+      let newlineIndex = buffer.indexOf('\n')
+      while (newlineIndex >= 0) {
+        const rawLine = buffer.slice(0, newlineIndex)
+        buffer = buffer.slice(newlineIndex + 1)
+        const line = rawLine.trim()
+        if (line.startsWith('data:')) {
+          const payload = line.slice(5).trimStart()
+          if (payload) {
+            try {
+              const data = JSON.parse(payload)
+              if (data.type === 'chunk') {
+                onChunk(data.content)
+              } else if (data.type === 'result') {
+                onResult(data.data)
+              }
+            } catch {
+              void 0
             }
-          } catch (e) {
-            // 忽略解析错误
           }
         }
+        newlineIndex = buffer.indexOf('\n')
       }
     }
   }).catch(onError)
   
-  return () => eventSource.close()
+  return () => controller.abort()
 }
 
 export async function refineDialogue(
@@ -113,7 +137,7 @@ export async function refineDialogue(
 
 export async function updateDialogues(
   sessionId: string,
-  dialogueList: any[]
+  dialogueList: DialogueItem[]
 ) {
   const response = await api.put(`/sessions/${sessionId}/dialogues`, {
     dialogue_list: dialogueList,
@@ -133,6 +157,57 @@ export async function confirmStage1(sessionId: string) {
 export async function matchVoices(sessionId: string) {
   const response = await api.post(`/sessions/${sessionId}/match`)
   return response.data
+}
+
+export function matchVoicesStream(
+  sessionId: string,
+  onChunk: (chunk: string) => void,
+  onResult: (result: unknown) => void,
+  onError: (error: Error) => void
+) {
+  const controller = new AbortController()
+  const url = `${apiBaseUrl}/sessions/${sessionId}/match/stream`
+
+  fetch(url, {
+    method: 'POST',
+    headers: defaultHeaders,
+    signal: controller.signal,
+  })
+    .then(async (response) => {
+      const reader = response.body?.getReader()
+      const decoder = new TextDecoder()
+
+      if (!reader) {
+        onError(new Error('No reader available'))
+        return
+      }
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        const text = decoder.decode(value)
+        const lines = text.split('\n')
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6))
+              if (data.type === 'chunk') {
+                onChunk(data.content)
+              } else if (data.type === 'result') {
+                onResult(data.data)
+              }
+            } catch (err) {
+              void err
+            }
+          }
+        }
+      }
+    })
+    .catch(onError)
+
+  return () => controller.abort()
 }
 
 export async function rematchVoices(
@@ -214,11 +289,11 @@ export async function previewVoice(voiceId: string, text?: string) {
 // ============================================================================
 
 export function getAudioUrl(sessionId: string, filename: string) {
-  return `/api/tts/audio/${sessionId}/${filename}`
+  return `${apiBaseUrl}/audio/${sessionId}/${filename}`
 }
 
 export function getMergedAudioUrl(sessionId: string) {
-  return `/api/tts/sessions/${sessionId}/merged-audio`
+  return `${apiBaseUrl}/sessions/${sessionId}/merged-audio`
 }
 
 export default api

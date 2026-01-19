@@ -65,6 +65,12 @@ export interface VoiceCategory {
   count: number
 }
 
+export interface UploadedUrl {
+  bucket: string
+  key: string
+  url: string
+}
+
 // ============================================================================
 // 会话模型
 // ============================================================================
@@ -80,6 +86,8 @@ export interface TTSSession {
   voice_mapping: VoiceMapping[]
   audio_files: string[]
   merged_audio?: string
+  audio_file_urls?: UploadedUrl[]
+  merged_audio_url?: UploadedUrl | null
   output_dir?: string
   error?: string
   created_at?: string
@@ -125,7 +133,7 @@ export type TTSEventType =
 
 export interface TTSEvent {
   type: TTSEventType
-  data: Record<string, any>
+  data: Record<string, unknown>
 }
 
 // ============================================================================

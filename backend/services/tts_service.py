@@ -22,6 +22,32 @@ from ..config import DOUBAO_TTS_APP_ID, DOUBAO_TTS_ACCESS_TOKEN, DOUBAO_TTS_CLUS
 
 logger = logging.getLogger(__name__)
 
+def _normalize_credential(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+    normalized = str(value).strip()
+    if not normalized:
+        return ""
+    normalized = normalized.strip("`").strip()
+    if (normalized.startswith('"') and normalized.endswith('"')) or (normalized.startswith("'") and normalized.endswith("'")):
+        normalized = normalized[1:-1].strip()
+    return normalized
+
+
+def _first_non_empty(*candidates: Optional[str]) -> str:
+    for candidate in candidates:
+        normalized = _normalize_credential(candidate)
+        if normalized:
+            return normalized
+    return ""
+
+def _first_non_empty_with_source(candidates: list[tuple[str, Optional[str]]]) -> tuple[str, str]:
+    for source, candidate in candidates:
+        normalized = _normalize_credential(candidate)
+        if normalized:
+            return normalized, source
+    return "", ""
+
 
 class DoubaoTTSService:
     """
@@ -82,8 +108,23 @@ class DoubaoTTSService:
             timeout: 请求超时时间 (秒)
         """
         # 优先级: 参数 > 配置文件 > 环境变量
-        self.app_id = app_id or DOUBAO_TTS_APP_ID or os.getenv("DOUBAO_TTS_APP_ID", "")
-        self.access_token = access_token or DOUBAO_TTS_ACCESS_TOKEN or os.getenv("DOUBAO_TTS_ACCESS_TOKEN", "")
+        self.app_id, self.app_id_source = _first_non_empty_with_source([
+            ("arg:app_id", app_id),
+            ("config:DOUBAO_TTS_APP_ID", DOUBAO_TTS_APP_ID),
+            ("env:DOUBAO_TTS_APP_ID", os.getenv("DOUBAO_TTS_APP_ID")),
+            ("env:DOUBAO_TTS_APP_KEY", os.getenv("DOUBAO_TTS_APP_KEY")),
+            ("env:DOUBAO_TTS_APPID", os.getenv("DOUBAO_TTS_APPID")),
+            ("env:TTS_APP_ID", os.getenv("TTS_APP_ID")),
+            ("env:TTS_APP_KEY", os.getenv("TTS_APP_KEY")),
+        ])
+        self.access_token, self.access_token_source = _first_non_empty_with_source([
+            ("arg:access_token", access_token),
+            ("config:DOUBAO_TTS_ACCESS_TOKEN", DOUBAO_TTS_ACCESS_TOKEN),
+            ("env:DOUBAO_TTS_ACCESS_TOKEN", os.getenv("DOUBAO_TTS_ACCESS_TOKEN")),
+            ("env:DOUBAO_TTS_AK", os.getenv("DOUBAO_TTS_AK")),
+            ("env:DOUBAO_TTS_ACCESS_KEY", os.getenv("DOUBAO_TTS_ACCESS_KEY")),
+            ("env:TTS_ACCESS_KEY", os.getenv("TTS_ACCESS_KEY")),
+        ])
         self.resource_id = resource_id
         self.timeout = timeout
         
@@ -92,13 +133,37 @@ class DoubaoTTSService:
         if not self.access_token:
             logger.warning("未设置 access_token，请在 config.py 或环境变量 DOUBAO_TTS_ACCESS_TOKEN 中设置")
     
+    def _resolve_credentials_for_resource(self, resource_id: str) -> tuple[str, str, str, str]:
+        if resource_id == "seed-tts-2.0":
+            app_id, app_id_source = _first_non_empty_with_source([
+                ("env:DOUBAO_TTS_APP_ID_TTS2", os.getenv("DOUBAO_TTS_APP_ID_TTS2")),
+                ("env:DOUBAO_TTS_APP_KEY_TTS2", os.getenv("DOUBAO_TTS_APP_KEY_TTS2")),
+                ("env:DOUBAO_TTS_APP_ID_2", os.getenv("DOUBAO_TTS_APP_ID_2")),
+                ("fallback:self.app_id", self.app_id),
+            ])
+            access_token, access_token_source = _first_non_empty_with_source([
+                ("env:DOUBAO_TTS_ACCESS_TOKEN_TTS2", os.getenv("DOUBAO_TTS_ACCESS_TOKEN_TTS2")),
+                ("env:DOUBAO_TTS_AK_TTS2", os.getenv("DOUBAO_TTS_AK_TTS2")),
+                ("env:DOUBAO_TTS_ACCESS_TOKEN_2", os.getenv("DOUBAO_TTS_ACCESS_TOKEN_2")),
+                ("env:DOUBAO_TTS_AK_2", os.getenv("DOUBAO_TTS_AK_2")),
+                ("fallback:self.access_token", self.access_token),
+            ])
+            return app_id, access_token, app_id_source, access_token_source
+        return self.app_id, self.access_token, self.app_id_source, self.access_token_source
+
     def _get_headers(self, request_id: Optional[str] = None, resource_id: Optional[str] = None) -> dict:
         """获取 V3 请求头"""
         actual_resource_id = resource_id or self.resource_id
+        app_id, access_token, _, _ = self._resolve_credentials_for_resource(actual_resource_id)
+        if not app_id or not access_token:
+            raise ValueError(
+                "豆包TTS鉴权缺失：请配置 DOUBAO_TTS_APP_ID 与 DOUBAO_TTS_AK/DOUBAO_TTS_ACCESS_TOKEN"
+            )
         headers = {
             "Content-Type": "application/json",
-            "X-Api-App-Id": self.app_id,
-            "X-Api-Access-Key": self.access_token,
+            "X-Api-App-Id": app_id,
+            "X-Api-App-Key": app_id,
+            "X-Api-Access-Key": access_token,
             "X-Api-Resource-Id": actual_resource_id,
         }
         if request_id:
@@ -233,9 +298,10 @@ class DoubaoTTSService:
                     if response.status_code != 200:
                         error_text = response.read().decode("utf-8", errors="ignore")
                         logger.error(f"🔊 HTTP 错误: status={response.status_code}, body={error_text[:200]}")
+                        _, _, app_id_source, access_token_source = self._resolve_credentials_for_resource(self.resource_id)
                         return TTSResult.from_error(
                             response.status_code,
-                            f"HTTP {response.status_code}: {error_text[:200]}",
+                            f"HTTP {response.status_code}: {error_text[:200]} (resource_id={self.resource_id}, app_id_source={app_id_source}, access_token_source={access_token_source})",
                             req_id,
                         )
                     
@@ -375,9 +441,10 @@ class DoubaoTTSService:
                     if response.status_code != 200:
                         error_text = response.read().decode("utf-8", errors="ignore")
                         logger.error(f"🔊 HTTP 错误: status={response.status_code}, body={error_text[:200]}")
+                        _, _, app_id_source, access_token_source = self._resolve_credentials_for_resource(resource_id)
                         return TTSResult.from_error(
                             response.status_code,
-                            f"HTTP {response.status_code}: {error_text[:200]}",
+                            f"HTTP {response.status_code}: {error_text[:200]} (resource_id={resource_id}, app_id_source={app_id_source}, access_token_source={access_token_source})",
                             req_id,
                         )
                     
@@ -479,7 +546,7 @@ class DoubaoTTSService:
                         error_text = (await response.aread()).decode("utf-8", errors="ignore")
                         return TTSResult.from_error(
                             response.status_code,
-                            f"HTTP {response.status_code}: {error_text[:200]}",
+                            f"HTTP {response.status_code}: {error_text[:200]} (resource_id={self.resource_id}, app_id_source={getattr(self, 'app_id_source', '')}, access_token_source={getattr(self, 'access_token_source', '')})",
                             req_id,
                         )
                     

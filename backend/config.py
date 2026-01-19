@@ -14,14 +14,14 @@ load_dotenv()
 # ========== 豆包 TTS API 凭据 ==========
 # 从环境变量获取，或使用默认值
 
-DOUBAO_TTS_APP_ID = os.getenv("DOUBAO_TTS_APP_ID", "8409212335")
-DOUBAO_TTS_ACCESS_TOKEN = os.getenv("DOUBAO_TTS_ACCESS_TOKEN", "6eZsgUFmqImTSH4wTbOEmnuxxsSsACRe")
-DOUBAO_TTS_SECRET_KEY = os.getenv("DOUBAO_TTS_SECRET_KEY", "AegS4NI3FxW4JJq02MSnvihtH5Pi_Hjs")
-DOUBAO_TTS_CLUSTER = os.getenv("DOUBAO_TTS_CLUSTER", "volcano_tts")
+DOUBAO_TTS_APP_ID = os.getenv("DOUBAO_TTS_APP_ID")
+DOUBAO_TTS_ACCESS_TOKEN = os.getenv("DOUBAO_TTS_ACCESS_TOKEN") or os.getenv("DOUBAO_TTS_AK") 
+DOUBAO_TTS_SECRET_KEY = os.getenv("DOUBAO_TTS_SECRET_KEY") or os.getenv("DOUBAO_TTS_SK")
+DOUBAO_TTS_CLUSTER = os.getenv("DOUBAO_TTS_CLUSTER")
 
 # ========== LLM API 配置 ==========
 
-LLM_API_KEY = os.getenv("LLM_API_KEY", "sk-mkeEEZUSawkxaEdq15miP6txwQoPTexBdPgsEOUanWw1QBi1")
+LLM_API_KEY = os.getenv("LLM_API_KEY")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.gptsapi.net/v1")
 LLM_MODEL = os.getenv("LLM_MODEL", "doubao-seed-1-8-251215")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))

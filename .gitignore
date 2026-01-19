@@ -7,6 +7,7 @@ __pycache__/
 env/
 venv/
 .venv/
+.venv_agentkit/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -41,8 +42,16 @@ logs/
 .env.local
 .env.*.local
 
+!.env_example
+!.env.example
+
+# AgentKit
+.agentkit/
+agentkit.yaml
+
 # Audio files
 *.mp3
 *.wav
 *.ogg
 output/
+docs/

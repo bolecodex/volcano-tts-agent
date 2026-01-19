@@ -46,6 +46,7 @@ class TTSSessionRepository:
     
     def create(
         self,
+        session_id: Optional[str] = None,
         user_input: Optional[str] = None,
         input_type: Optional[str] = None,
         project_id: Optional[int] = None,
@@ -53,8 +54,14 @@ class TTSSessionRepository:
     ) -> TTSSession:
         """创建新的 TTS 会话"""
         with self._get_session() as session:
+            if session_id:
+                existing = session.query(TTSSession).filter(TTSSession.session_id == session_id).first()
+                if existing:
+                    session.expunge(existing)
+                    return existing
+
             tts_session = TTSSession(
-                session_id=generate_session_id(),
+                session_id=session_id or generate_session_id(),
                 user_input=user_input,
                 input_type=input_type,
                 project_id=project_id,

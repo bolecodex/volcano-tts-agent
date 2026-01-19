@@ -37,14 +37,24 @@ interface ResultPanelProps {
   sessionId: string
   audioFiles: string[]
   mergedAudio?: string
+  audioFileUrls?: string[]
+  mergedAudioUrl?: string | null
   dialogues: DialogueItem[]
 }
 
-export default function ResultPanel({ sessionId, audioFiles, mergedAudio, dialogues }: ResultPanelProps) {
+export default function ResultPanel({
+  sessionId,
+  audioFiles,
+  mergedAudio,
+  audioFileUrls: audioFileUrlsOverride,
+  mergedAudioUrl: mergedAudioUrlOverride,
+  dialogues,
+}: ResultPanelProps) {
   const [playingMerged, setPlayingMerged] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
   const mergedAudioRef = useRef<HTMLAudioElement>(null)
+  const [mergedPlayableUrl, setMergedPlayableUrl] = useState<string | null>(null)
   
   // 高亮状态管理
   const [highlightIndex, setHighlightIndex] = useState<number | null>(null)
@@ -59,70 +69,185 @@ export default function ResultPanel({ sessionId, audioFiles, mergedAudio, dialog
   const listContainerRef = useRef<HTMLDivElement>(null)
   const itemRefs = useRef<Map<number, HTMLDivElement>>(new Map())
 
+  const runtimeBaseUrl = (import.meta.env.VITE_TTS_API_BASE_URL || '').trim().replace(/\/$/, '')
+  const runtimeApiKey = (import.meta.env.VITE_TTS_API_KEY || '').trim()
+
+  const cleanUrl = useCallback((url: string) => {
+    const trimmed = url.trim()
+    const withoutTicks = trimmed.replace(/^`+/, '').replace(/`+$/, '').trim()
+    return withoutTicks
+  }, [])
+
+  const needsAuthHeader = useCallback(
+    (url: string) => Boolean(runtimeApiKey && runtimeBaseUrl && cleanUrl(url).startsWith(runtimeBaseUrl)),
+    [cleanUrl, runtimeApiKey, runtimeBaseUrl]
+  )
+
+  const downloadBlob = useCallback((blob: Blob, filename: string) => {
+    const objectUrl = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = objectUrl
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(objectUrl)
+  }, [])
+
+  const fetchAudioBlob = useCallback(
+    async (url: string, signal?: AbortSignal) => {
+      const targetUrl = cleanUrl(url)
+      const headers: Record<string, string> = {}
+      if (needsAuthHeader(targetUrl)) {
+        headers.Authorization = `Bearer ${runtimeApiKey}`
+      }
+      const response = await fetch(targetUrl, {
+        method: 'GET',
+        headers,
+        signal,
+      })
+      if (!response.ok) {
+        throw new Error(`音频请求失败: ${response.status}`)
+      }
+      return await response.blob()
+    },
+    [cleanUrl, needsAuthHeader, runtimeApiKey]
+  )
+
   // 音频 URL
   const mergedAudioUrl = useMemo(
-    () => mergedAudio ? getMergedAudioUrl(sessionId) : null,
-    [sessionId, mergedAudio]
+    () => {
+      if (!mergedAudio) return null
+      if (mergedAudioUrlOverride) return cleanUrl(mergedAudioUrlOverride)
+      return getMergedAudioUrl(sessionId)
+    },
+    [cleanUrl, mergedAudio, mergedAudioUrlOverride, sessionId]
   )
   
   const audioFileUrls = useMemo(
-    () => audioFiles.map((path, i) => getAudioUrl(sessionId, path.split('/').pop() || `${i}.mp3`)),
-    [sessionId, audioFiles]
+    () => {
+      if (audioFileUrlsOverride && audioFileUrlsOverride.length > 0) {
+        return audioFileUrlsOverride.map(cleanUrl)
+      }
+      return audioFiles.map((path, i) => getAudioUrl(sessionId, path.split('/').pop() || `${i}.mp3`))
+    },
+    [audioFileUrlsOverride, audioFiles, cleanUrl, sessionId]
   )
 
   // 动态加载所有音频文件的时长
   useEffect(() => {
     if (audioFileUrls.length === 0) return
     
-    const loadDurations = async () => {
+    const controller = new AbortController()
+    const signal = controller.signal
+    let cancelled = false
+
+    const getDurationForUrl = async (rawUrl: string): Promise<number> => {
+      const targetUrl = cleanUrl(rawUrl)
+      let objectUrl: string | null = null
+      const audio = new Audio()
+      audio.preload = 'metadata'
+
+      const durationSec = await new Promise<number>((resolve) => {
+        if (signal.aborted) return resolve(2)
+
+        let settled = false
+        let timer = 0
+
+        const cleanup = () => {
+          window.clearTimeout(timer)
+          audio.removeEventListener('loadedmetadata', onLoadedMetadata)
+          audio.removeEventListener('error', onError)
+          signal.removeEventListener('abort', onAbort)
+        }
+
+        const settle = (value: number) => {
+          if (settled) return
+          settled = true
+          cleanup()
+          resolve(value || 2)
+        }
+
+        const onLoadedMetadata = () => settle(audio.duration || 2)
+        const onError = () => settle(2)
+        const onAbort = () => settle(2)
+
+        timer = window.setTimeout(() => settle(2), 8000)
+        audio.addEventListener('loadedmetadata', onLoadedMetadata)
+        audio.addEventListener('error', onError)
+        signal.addEventListener('abort', onAbort)
+
+        void (async () => {
+          try {
+            if (needsAuthHeader(targetUrl)) {
+              const blob = await fetchAudioBlob(targetUrl, signal)
+              objectUrl = URL.createObjectURL(blob)
+              audio.src = objectUrl
+            } else {
+              audio.src = targetUrl
+            }
+            audio.load()
+          } catch {
+            settle(2)
+          }
+        })()
+      })
+
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+      return durationSec
+    }
+
+    void (async () => {
       const durations: number[] = []
-      
       for (const url of audioFileUrls) {
+        if (cancelled) return
         try {
-          const audio = new Audio(url)
-          const durationSec = await new Promise<number>((resolve) => {
-            audio.addEventListener('loadedmetadata', () => {
-              resolve(audio.duration)
-            })
-            audio.addEventListener('error', () => {
-              resolve(2)
-            })
-            setTimeout(() => resolve(2), 5000)
-          })
-          durations.push(durationSec)
+          durations.push(await getDurationForUrl(url))
         } catch {
           durations.push(2)
         }
       }
-      
-      setLoadedDurations(durations)
+      if (!cancelled) setLoadedDurations(durations)
+    })()
+
+    return () => {
+      cancelled = true
+      controller.abort()
     }
-    
-    loadDurations()
-  }, [audioFileUrls])
+  }, [audioFileUrls, cleanUrl, fetchAudioBlob, needsAuthHeader])
 
   // 计算每条对话在合并音频中的时间范围
   const timeRanges = useMemo<TimeRange[]>(() => {
     const ranges: TimeRange[] = []
-    const GAP_SEC = 0.5
+    const DEFAULT_GAP_SEC = 0.5
+    const n = dialogues.length
+    const itemDurationsSec = dialogues.map((dialogue, i) => {
+      return loadedDurations[i] || (dialogue.duration_ms ? dialogue.duration_ms / 1000 : 2)
+    })
+    const totalItemsSec = itemDurationsSec.reduce((sum, d) => sum + d, 0)
+
+    const inferredGapSec =
+      duration > 0 && n > 1
+        ? Math.max((duration - totalItemsSec) / (n - 1), 0)
+        : DEFAULT_GAP_SEC
+
+    const baseTotalSec = totalItemsSec + inferredGapSec * Math.max(n - 1, 0)
+    const scale = duration > 0 && baseTotalSec > 0 ? duration / baseTotalSec : 1
+
     let currentStart = 0
     
     for (let i = 0; i < dialogues.length; i++) {
-      const dialogue = dialogues[i]
-      const durationSec = loadedDurations[i] 
-        || (dialogue.duration_ms ? dialogue.duration_ms / 1000 : 2)
+      const durationSec = itemDurationsSec[i]
       ranges.push({
         start: currentStart,
-        end: currentStart + durationSec,
+        end: currentStart + durationSec * scale,
       })
-      currentStart += durationSec
+      currentStart += durationSec * scale
       if (i < dialogues.length - 1) {
-        currentStart += GAP_SEC
+        currentStart += inferredGapSec * scale
       }
     }
     
     return ranges
-  }, [dialogues, loadedDurations])
+  }, [dialogues, duration, loadedDurations])
 
   // 根据当前播放时间查找对应的对话索引
   const findCurrentDialogueIndex = useCallback((time: number): { index: number | null; progress: number } => {
@@ -196,7 +321,7 @@ export default function ResultPanel({ sessionId, audioFiles, mergedAudio, dialog
 
   // 播放/暂停合并音频
   const toggleMergedPlay = async () => {
-    if (!mergedAudioRef.current) return
+    if (!mergedAudioRef.current || !mergedAudioUrl) return
 
     if (playingMerged) {
       mergedAudioRef.current.pause()
@@ -205,6 +330,28 @@ export default function ResultPanel({ sessionId, audioFiles, mergedAudio, dialog
     } else {
       try {
         setPlayingItemIndex(null)
+
+        const targetUrl = cleanUrl(mergedAudioUrl)
+        let playable = targetUrl
+        if (needsAuthHeader(targetUrl)) {
+          if (!mergedPlayableUrl) {
+            const blob = await fetchAudioBlob(targetUrl)
+            const objectUrl = URL.createObjectURL(blob)
+            setMergedPlayableUrl(prev => {
+              if (prev) URL.revokeObjectURL(prev)
+              return objectUrl
+            })
+            playable = objectUrl
+          } else {
+            playable = mergedPlayableUrl
+          }
+        }
+
+        if (mergedAudioRef.current.src !== playable) {
+          mergedAudioRef.current.pause()
+          mergedAudioRef.current.src = playable
+          mergedAudioRef.current.load()
+        }
         
         await mergedAudioRef.current.play()
         setPlayingMerged(true)
@@ -241,12 +388,44 @@ export default function ResultPanel({ sessionId, audioFiles, mergedAudio, dialog
     return `${prefix}_${timestamp}.${ext}`
   }
 
-  const handleDownload = (url: string, filename: string) => {
-    const a = document.createElement('a')
-    a.href = url
-    a.download = filename
-    a.click()
-  }
+  const handleDownload = useCallback(
+    async (url: string, filename: string) => {
+      const targetUrl = cleanUrl(url)
+      try {
+        if (needsAuthHeader(targetUrl)) {
+          const blob = await fetchAudioBlob(targetUrl)
+          downloadBlob(blob, filename)
+          return
+        }
+
+        const a = document.createElement('a')
+        a.href = targetUrl
+        a.download = filename
+        a.click()
+      } catch (err) {
+        console.error('下载失败:', err)
+      }
+    },
+    [cleanUrl, downloadBlob, fetchAudioBlob, needsAuthHeader]
+  )
+
+  useEffect(() => {
+    if (mergedAudioRef.current) {
+      mergedAudioRef.current.pause()
+      mergedAudioRef.current.src = ''
+      mergedAudioRef.current.load()
+    }
+    setPlayingMerged(false)
+    setPlayingSource(null)
+    setHighlightIndex(null)
+    setCharProgress(0)
+    setCurrentTime(0)
+    setDuration(0)
+    setMergedPlayableUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev)
+      return null
+    })
+  }, [mergedAudioUrl])
 
   return (
     <div className="space-y-8">
@@ -282,7 +461,10 @@ export default function ResultPanel({ sessionId, audioFiles, mergedAudio, dialog
               <p className="text-sm text-slate-500">所有对话合并后的完整音频</p>
             </div>
             <button
-              onClick={() => handleDownload(mergedAudioUrl, generateTimestampFilename('dialogue_full'))}
+              onClick={() => {
+                if (!mergedAudioUrl) return
+                void handleDownload(mergedAudioUrl, generateTimestampFilename('dialogue_full'))
+              }}
               className="flex items-center gap-2 px-4 py-2 bg-neon-green hover:bg-neon-green/80 
                        text-cyber-bg rounded-xl transition-colors cursor-pointer"
             >
@@ -317,7 +499,7 @@ export default function ResultPanel({ sessionId, audioFiles, mergedAudio, dialog
 
           <audio
             ref={mergedAudioRef}
-            src={mergedAudioUrl}
+            preload="none"
             onTimeUpdate={(e) => handleMergedTimeUpdate(e.currentTarget.currentTime)}
             onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
             onEnded={handleMergedEnded}
@@ -342,7 +524,7 @@ export default function ResultPanel({ sessionId, audioFiles, mergedAudio, dialog
               const timestamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
               audioFileUrls.forEach((url, i) => {
                 setTimeout(() => {
-                  handleDownload(url, `dialogue_${String(i + 1).padStart(3, '0')}_${timestamp}.mp3`)
+                  void handleDownload(url, `dialogue_${String(i + 1).padStart(3, '0')}_${timestamp}.mp3`)
                 }, i * 200)
               })
             }}
@@ -383,7 +565,7 @@ export default function ResultPanel({ sessionId, audioFiles, mergedAudio, dialog
                 charProgress={isHighlighted && playingSource === 'merged' ? charProgress : 0}
                 onPlayStart={() => handleItemPlayStart(index)}
                 onPlayEnd={() => handleItemPlayEnd(index)}
-                onDownload={() => handleDownload(url, generateTimestampFilename(`dialogue_${String(index + 1).padStart(3, '0')}`))}
+                onDownload={() => void handleDownload(url, generateTimestampFilename(`dialogue_${String(index + 1).padStart(3, '0')}`))}
               />
             )
           })}
@@ -464,6 +646,33 @@ const AudioFileItem = forwardRef<HTMLDivElement, AudioFileItemProps>(
     const [isExpanded, setIsExpanded] = useState(false)
     const [localProgress, setLocalProgress] = useState(0)
     const audioRef = useRef<HTMLAudioElement>(null)
+    const [playableUrl, setPlayableUrl] = useState<string | null>(null)
+    const playableObjectUrlRef = useRef<string | null>(null)
+
+    const runtimeBaseUrl = (import.meta.env.VITE_TTS_API_BASE_URL || '').trim().replace(/\/$/, '')
+    const runtimeApiKey = (import.meta.env.VITE_TTS_API_KEY || '').trim()
+
+    const cleanUrl = (u: string) => {
+      const trimmed = u.trim()
+      return trimmed.replace(/^`+/, '').replace(/`+$/, '').trim()
+    }
+
+    const needsAuthHeader = (u: string) => Boolean(runtimeApiKey && runtimeBaseUrl && cleanUrl(u).startsWith(runtimeBaseUrl))
+
+    const revokePlayableObjectUrl = useCallback(() => {
+      if (playableObjectUrlRef.current) {
+        URL.revokeObjectURL(playableObjectUrlRef.current)
+        playableObjectUrlRef.current = null
+      }
+    }, [])
+
+    useEffect(() => {
+      revokePlayableObjectUrl()
+      setPlayableUrl(null)
+      return () => {
+        revokePlayableObjectUrl()
+      }
+    }, [revokePlayableObjectUrl, url])
 
     useEffect(() => {
       if (shouldStopPlaying && isPlaying && audioRef.current) {
@@ -493,6 +702,36 @@ const AudioFileItem = forwardRef<HTMLDivElement, AudioFileItemProps>(
       } else {
         try {
           onPlayStart?.()
+          const targetUrl = cleanUrl(url)
+
+          let playable = targetUrl
+          if (needsAuthHeader(targetUrl)) {
+            if (!playableUrl) {
+              const response = await fetch(targetUrl, {
+                method: 'GET',
+                headers: {
+                  Authorization: `Bearer ${runtimeApiKey}`,
+                },
+              })
+              if (!response.ok) {
+                throw new Error(`音频请求失败: ${response.status}`)
+              }
+              const blob = await response.blob()
+              const objectUrl = URL.createObjectURL(blob)
+              revokePlayableObjectUrl()
+              playableObjectUrlRef.current = objectUrl
+              setPlayableUrl(objectUrl)
+              playable = objectUrl
+            } else {
+              playable = playableUrl
+            }
+          }
+
+          if (audioRef.current.src !== playable) {
+            audioRef.current.pause()
+            audioRef.current.src = playable
+            audioRef.current.load()
+          }
           await audioRef.current.play()
           setIsPlaying(true)
         } catch (err) {
@@ -621,7 +860,7 @@ const AudioFileItem = forwardRef<HTMLDivElement, AudioFileItemProps>(
 
           <audio
             ref={audioRef}
-            src={url}
+            preload="none"
             onTimeUpdate={handleTimeUpdate}
             onEnded={handleEnded}
           />

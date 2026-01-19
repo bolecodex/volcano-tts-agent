@@ -1,0 +1,69 @@
+# AgentKit configuration
+agentkit.yaml
+agentkit*.yaml
+.agentkit/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# Logs / temp
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Virtual environments
+.venv/
+.venv_agentkit/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+.windsurf/
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile*
+.dockerignore
+
+# Environment
+.env
+.env.*
+
+# Frontend dependencies / build artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Local runtime data
+data/
