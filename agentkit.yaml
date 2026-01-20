@@ -1,0 +1,35 @@
+common:
+  agent_name: tts_agent_standalone
+  entry_point: tts_agentkit.py
+  description: AgentKit project tts_agent_standalone - TTS Agent
+  language: Python
+  language_version: '3.12'
+  agent_type: Basic App
+  dependencies_file: requirements.txt
+  runtime_envs: {}
+  launch_type: cloud
+launch_types:
+  cloud:
+    region: cn-beijing
+    tos_bucket: agentkit-platform-2109434610
+    tos_prefix: agentkit-builds
+    image_tag: '{{timestamp}}'
+    cr_instance_name: agentkit-platform-2109434610
+    cr_namespace_name: agentkit
+    cr_repo_name: tts_agent_standalone
+    cr_auto_create_instance_type: Micro
+    cr_image_full_url: agentkit-platform-2109434610-cn-beijing.cr.volces.com/agentkit/tts_agent_standalone:20260119220851
+    build_timeout: 3600
+    cp_workspace_name: agentkit-cli-workspace
+    cp_pipeline_name: tts-agent
+    cp_pipeline_id: 67d9b3b8e8f746678361f159d27714dd
+    runtime_id: r-yedv29tbeontl8dnn0lv
+    runtime_name: tts-agent
+    runtime_role_name: AgentKit-Runtime-Default-ServiceRole-2mwi5mg
+    runtime_auth_type: key_auth
+    runtime_apikey_name: API-KEY-536zdd2a
+    runtime_apikey: 7lj2k3nW7fEmWRrbGE-lAlvrfjfcpmF4zv5h
+    runtime_jwt_allowed_clients: []
+    runtime_endpoint: https://sd5mu8fjal76cj6rag3dg.apigateway-cn-beijing.volceapi.com
+docker_build:
+  platform: auto

@@ -47,11 +47,9 @@ logs/
 
 # AgentKit
 .agentkit/
-agentkit.yaml
 
 # Audio files
 *.mp3
 *.wav
 *.ogg
 output/
-docs/
