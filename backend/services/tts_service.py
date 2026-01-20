@@ -22,6 +22,24 @@ from ..config import DOUBAO_TTS_APP_ID, DOUBAO_TTS_ACCESS_TOKEN, DOUBAO_TTS_CLUS
 
 logger = logging.getLogger(__name__)
 
+_VOICE_ALIASES: dict[str, str] = {
+    "zh_male_ahu_uranus_bigtts": "zh_male_wennuanahu_uranus_bigtts",
+}
+
+
+def _normalize_voice_type(voice_type: str) -> str:
+    if not voice_type:
+        return voice_type
+    return _VOICE_ALIASES.get(voice_type, voice_type)
+
+
+def _is_clone_voice(voice_type: str) -> bool:
+    if not voice_type:
+        return False
+    lower = voice_type.lower()
+    return lower.startswith("icl_") or "_icl_" in lower
+
+
 def _normalize_credential(value: Optional[str]) -> str:
     if value is None:
         return ""
@@ -272,6 +290,7 @@ class DoubaoTTSService:
         Returns:
             TTSResult: 合成结果
         """
+        config.voice_type = _normalize_voice_type(config.voice_type)
         req_id = str(uuid.uuid4())
         
         # 构建请求
@@ -410,9 +429,10 @@ class DoubaoTTSService:
             )
             result = tts.synthesize_auto("你太过分了！", config)
         """
-        # 自动检测版本
+        config.voice_type = _normalize_voice_type(config.voice_type)
         version = config.api_version or detect_voice_version(config.voice_type)
-        resource_id = get_resource_id(version)
+        is_clone = _is_clone_voice(config.voice_type)
+        resource_id = get_resource_id(version, is_clone=is_clone)
         
         req_id = str(uuid.uuid4())
         
@@ -479,6 +499,21 @@ class DoubaoTTSService:
                             continue
                     
                     if last_error:
+                        if (
+                            last_error[1]
+                            and "resource id is mismatched with speaker related resource" in str(last_error[1]).lower()
+                        ):
+                            alt_resource_id = get_resource_id(version, is_clone=not is_clone)
+                            if alt_resource_id and alt_resource_id != resource_id:
+                                retry = self._synthesize_auto_with_resource(
+                                    text=text,
+                                    config=config,
+                                    output_path=output_path,
+                                    version=version,
+                                    resource_id=alt_resource_id,
+                                )
+                                if retry.success:
+                                    return retry
                         return TTSResult.from_error(last_error[0], last_error[1], req_id)
                     
                     if not audio_chunks:
@@ -507,6 +542,81 @@ class DoubaoTTSService:
             return TTSResult.from_error(-1, f"HTTP 错误: {str(e)}", req_id)
         except Exception as e:
             logger.error(f"🔊 未知错误: {e}")
+            return TTSResult.from_error(-1, f"未知错误: {str(e)}", req_id)
+
+    def _synthesize_auto_with_resource(
+        self,
+        text: str,
+        config: TTSConfig,
+        output_path: Optional[str],
+        version: str,
+        resource_id: str,
+    ) -> TTSResult:
+        req_id = str(uuid.uuid4())
+        payload = self._build_request_payload(text, config, version=version)
+
+        logger.info(
+            f"🔊 [Auto-Retry] 开始合成: reqid={req_id[:8]}..., version={version}, resource_id={resource_id}, voice={config.voice_type}"
+        )
+
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                with client.stream(
+                    "POST",
+                    self.API_URL,
+                    headers=self._get_headers(req_id, resource_id=resource_id),
+                    json=payload,
+                ) as response:
+                    if response.status_code != 200:
+                        error_text = response.read().decode("utf-8", errors="ignore")
+                        logger.error(
+                            f"🔊 [Auto-Retry] HTTP 错误: status={response.status_code}, body={error_text[:200]}"
+                        )
+                        _, _, app_id_source, access_token_source = self._resolve_credentials_for_resource(resource_id)
+                        return TTSResult.from_error(
+                            response.status_code,
+                            f"HTTP {response.status_code}: {error_text[:200]} (resource_id={resource_id}, app_id_source={app_id_source}, access_token_source={access_token_source})",
+                            req_id,
+                        )
+
+                    audio_chunks = []
+                    last_error = None
+
+                    for line in response.iter_lines():
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                            code = data.get("code", 0)
+                            message = data.get("message", "")
+
+                            if code == 20000000:
+                                break
+                            if code != 0:
+                                last_error = (code, message)
+                                break
+                            audio_base64 = data.get("data")
+                            if audio_base64:
+                                audio_chunks.append(base64.b64decode(audio_base64))
+                        except json.JSONDecodeError:
+                            continue
+
+                    if last_error:
+                        return TTSResult.from_error(last_error[0], last_error[1], req_id)
+                    if not audio_chunks:
+                        return TTSResult.from_error(-1, "未收到音频数据", req_id)
+
+                    audio_data = b"".join(audio_chunks)
+                    saved_path = None
+                    if output_path:
+                        saved_path = self._save_audio(audio_data, output_path, config.encoding)
+
+                    return TTSResult.from_success(
+                        audio_data=audio_data,
+                        request_id=req_id,
+                        audio_path=saved_path,
+                    )
+        except Exception as e:
             return TTSResult.from_error(-1, f"未知错误: {str(e)}", req_id)
 
     
